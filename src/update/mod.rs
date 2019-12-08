@@ -113,49 +113,11 @@ async fn get_store_paths(url: &str) -> Result<Vec<StorePath>> {
         .lines()
         .map(|line| {
             let line = line?;
-            parse_nix_path(&line).ok_or_else(|| format_err!("Invalid store path: '{}'", line))
+            Ok(line
+                .parse::<StorePath>()
+                .with_context(|err| format_err!("Invalid store path '{}': {}", line, err))?)
         })
         .collect()
-}
-
-// https://github.com/NixOS/nix/blob/abb8ef619ba2fab3ae16fb5b5430215905bac723/src/libstore/store-api.cc#L85
-fn parse_nix_path(path: &str) -> Option<StorePath> {
-    const PREFIX: &[u8] = b"/nix/store/";
-    const NIX_PATH_HASH_LEN: usize = 32;
-    const SEP_POS: usize = PREFIX.len() + NIX_PATH_HASH_LEN;
-    const MIN_LEN: usize = SEP_POS + 1 + 1;
-    const MAX_LEN: usize = 212;
-
-    fn is_valid_hash(s: &[u8]) -> bool {
-        s.iter().all(|&b| match b {
-            b'e' | b'o' | b'u' | b't' => false,
-            b'a'..=b'z' | b'0'..=b'9' => true,
-            _ => false,
-        })
-    }
-
-    fn is_valid_name(s: &[u8]) -> bool {
-        const VALID_CHARS: &[u8] = b"+-._?=";
-        s.iter()
-            .all(|&b| b.is_ascii_alphanumeric() || VALID_CHARS.contains(&b))
-    }
-
-    let path = path.as_bytes();
-    if MIN_LEN <= path.len() && path.len() <= MAX_LEN && path[SEP_POS] == b'-' {
-        let hash = &path[PREFIX.len()..SEP_POS];
-        let name = &path[SEP_POS + 1..];
-        if is_valid_hash(hash) && is_valid_name(name) {
-            use std::str::from_utf8;
-
-            // Already checked
-            return Some(StorePath {
-                hash: from_utf8(hash).ok().unwrap().to_owned(),
-                name: from_utf8(name).ok().unwrap().to_owned(),
-            });
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -163,38 +125,25 @@ mod tests {
     use super::*;
     use crate::{block_on, database::model::*};
     use chrono::{Duration, Utc};
-    // use std::future::Future;
-    // use tokio::runtime::current_thread::Runtime;
 
     #[test]
     fn test_parse_nix_path() {
-        assert_eq!(parse_nix_path(""), None);
-        assert_eq!(parse_nix_path("/nix/store💗️"), None);
-        assert_eq!(parse_nix_path("/nix/store/"), None);
+        let p = |s: &str| s.parse::<StorePath>();
+
+        assert!(p("").is_err());
+        assert!(p("/nix/store💗️").is_err());
+        assert!(p("/nix/store/").is_err());
+        assert!(p("/nix/store/00000000000000000000000000000000").is_err());
+        assert!(p("/nix/store/0000000000000000000000000000000💗️").is_err());
+        assert!(p("/nix/store/00000000000000000000000000000000-").is_err());
+        assert!(p("/nix/store/00000000000000000000000000000000-💗️").is_err());
         assert_eq!(
-            parse_nix_path("/nix/store/00000000000000000000000000000000"),
-            None
-        );
-        assert_eq!(
-            parse_nix_path("/nix/store/0000000000000000000000000000000💗️"),
-            None
-        );
-        assert_eq!(
-            parse_nix_path("/nix/store/00000000000000000000000000000000-"),
-            None,
-        );
-        assert_eq!(
-            parse_nix_path("/nix/store/00000000000000000000000000000000-💗️"),
-            None
-        );
-        assert_eq!(
-            parse_nix_path(
-                "/nix/store/5yr2767rqnvwvsfy445ny41lk67fcjjh-VSCode_1.40.1_linux-x64.tar.gz"
-            ),
-            Some(StorePath {
+            p("/nix/store/5yr2767rqnvwvsfy445ny41lk67fcjjh-VSCode_1.40.1_linux-x64.tar.gz")
+                .unwrap(),
+            StorePath {
                 hash: "5yr2767rqnvwvsfy445ny41lk67fcjjh".to_owned(),
                 name: "VSCode_1.40.1_linux-x64.tar.gz".to_owned(),
-            }),
+            },
         );
     }
 
