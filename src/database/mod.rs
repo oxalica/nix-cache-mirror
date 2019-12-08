@@ -218,9 +218,16 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile;
 
     #[test]
     fn test_init_sql() {
-        let _db = Database::open_in_memory().unwrap();
+        let _ = Database::open_in_memory().unwrap();
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        // Initialize
+        let _ = Database::open(file.path()).unwrap();
+        // Reopen
+        let _ = Database::open(file.path()).unwrap();
     }
 }

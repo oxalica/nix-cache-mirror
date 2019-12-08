@@ -10,7 +10,8 @@ fn main() {
     env_logger::init();
 
     // add_channel();
-    serve();
+    add_raw_channel();
+    // serve();
 }
 
 fn add_channel() {
@@ -24,6 +25,28 @@ fn add_channel() {
         .await
         .unwrap();
     });
+}
+
+fn add_raw_channel() {
+    use nix_cache_mirror::database::StorePath;
+
+    let mut db = Database::open("./data/db.sqlite").unwrap();
+    update::add_raw_generation(
+        &mut db,
+        "https://nixos.org/channels/nixos-unstable",
+        &Default::default(),
+        vec![
+            StorePath {
+                hash: "xlxiw4rnxx2dksa91fizjzf7jb5nqghc".to_owned(),
+                name: "glibc-2.27".to_owned(),
+            },
+            StorePath {
+                hash: "yhzvzdq82lzk0kvrp3i79yhjnhps6qpk".to_owned(),
+                name: "hello-2.10".to_owned(),
+            },
+        ],
+    )
+    .unwrap();
 }
 
 fn serve() {

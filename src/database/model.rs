@@ -15,9 +15,13 @@ pub struct Generation {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GenerationExtraInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_paths: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_file_size: Option<i64>,
 }
 
