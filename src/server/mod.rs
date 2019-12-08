@@ -124,7 +124,7 @@ fn parse_content_range(req: &Request, file_size: u64) -> Option<Range<u64>> {
 }
 
 fn serve_nar_file(data: &ServerData, req: &Request, hash: &str, head_only: bool) -> TryResponse {
-    use futures::future::TryFutureExt;
+    use futures::TryFutureExt;
 
     log::debug!("Get nar file: {}", hash);
     let file_size = match data.nar_info_cache.get_file_size(hash) {

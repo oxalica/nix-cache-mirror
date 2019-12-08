@@ -1,23 +1,27 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Generation {
     pub id: i64,
     pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
 
-    pub channel_url: String,
     pub cache_url: String,
-    pub git_revision: String,
-
-    pub total_paths: Option<i64>,
-    pub total_file_size: Option<i64>,
+    pub extra_info: GenerationExtraInfo,
 
     pub status: GenerationStatus,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct GenerationExtraInfo {
+    pub channel_url: Option<String>,
+    pub total_paths: Option<i64>,
+    pub total_file_size: Option<i64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum GenerationStatus {
     Canceled,
     Pending,
@@ -59,4 +63,10 @@ impl fmt::Display for NarInfo {
         write!(f, "Sig: {}\n", self.sig)?;
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct StorePath {
+    pub hash: String,
+    pub name: String,
 }

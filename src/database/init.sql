@@ -13,9 +13,8 @@ CREATE TABLE IF NOT EXISTS generation (
     end_time TEXT NULL
         DEFAULT NULL,
 
-    channel_url TEXT NOT NULL,
     cache_url TEXT NOT NULL,
-    git_revision TEXT NOT NULL,
+    extra_info TEXT NOT NULL, -- JSON
 
     total_paths INTEGER NULL
         DEFAULT NULL,
@@ -28,6 +27,22 @@ CREATE TABLE IF NOT EXISTS generation (
             status IN ('canceled', 'pending', 'indexing', 'downloading', 'finished') AND
             (status = 'finished') = (end_time IS NOT NULL)
         )
+);
+
+CREATE TABLE IF NOT EXISTS generation_root (
+    generation_id INTEGER NOT NULL
+        REFERENCES generation(id),
+
+    -- The hash is not present in `nar_info` in progress of indexing (fetching meta).
+    nar_id INTEGER NULL
+        DEFAULT NULL
+        REFERENCES nar_info(id),
+
+    hash TEXT NOT NULL,
+    name TEXT NOT NULL
+    
+    -- UNIQUE (generation_id, nar_info)
+    -- UNIQUE (generation_id, hash)
 );
 
 CREATE TABLE IF NOT EXISTS nar_info (
@@ -56,14 +71,6 @@ CREATE TABLE IF NOT EXISTS nar_info (
     deriver TEXT NULL,
 
     sig TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS generation_reference (
-    generation_id INTEGER NOT NULL
-        REFERENCES generation(id),
-    reference_id INTEGER NOT NULL
-        REFERENCES nar_info(id)
-    -- UNIQUE (generation_id, reference_id)
 );
 
 CREATE TABLE IF NOT EXISTS nar_reference (

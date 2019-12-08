@@ -7,13 +7,19 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-std = "1.2.0"
 chrono = "0.4.10"
+env_logger = "0.7.1"
 failure = "0.1.6"
 futures = { version = "0.3.1", features = ["compat"] }
 futures01 = { package = "futures", version = "0.1" }
 hyper = "0.12.35"
-rusqlite = { version = "0.20.0", features = ["chrono"] }
-log = "0.4.8"
-env_logger = "0.7.1"
-async-std = "1.2.0"
 lazy_static = "1.4.0"
+log = "0.4.8"
+reqwest = "0.9.22"
+rusqlite = { version = "0.20.0", features = ["chrono", "serde_json"] }
+serde = { version = "1.0.103", features = ["derive"] }
+serde_json = "1.0.44"
+static_assertions = "1.1.0"
+tokio = "0.1" # Match the version used by `hyper`
+xz2 = "0.1.6"

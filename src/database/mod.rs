@@ -1,10 +1,12 @@
 use failure::Fail;
-use rusqlite::{self, types, Connection, NO_PARAMS};
+use rusqlite::{self, named_params, types, Connection, TransactionBehavior, NO_PARAMS};
+use serde_json;
+use static_assertions::*;
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, Error>;
 
-mod model;
+pub mod model;
 pub use self::model::*;
 
 impl types::FromSql for GenerationStatus {
@@ -18,6 +20,20 @@ impl types::FromSql for GenerationStatus {
             "finished" => Self::Finished,
             _ => unreachable!(),
         })
+    }
+}
+
+impl types::FromSql for GenerationExtraInfo {
+    fn column_result(value: types::ValueRef) -> types::FromSqlResult<Self> {
+        let v: String = types::FromSql::column_result(value)?;
+        Ok(serde_json::from_str(&v).map_err(|err| types::FromSqlError::Other(Box::new(err)))?)
+    }
+}
+
+impl types::ToSql for GenerationExtraInfo {
+    fn to_sql(&self) -> rusqlite::Result<types::ToSqlOutput<'_>> {
+        let v = serde_json::to_string(self).unwrap();
+        Ok(types::ToSqlOutput::Owned(types::Value::Text(v)))
     }
 }
 
@@ -45,12 +61,13 @@ pub struct Database {
     conn: Connection,
 }
 
+assert_not_impl_any!(Database: Sync);
+
 impl Database {
     const APPLICATION_ID: i32 = 0x2237186b;
     const USER_VERSION: i32 = 1;
     const INIT_SQL: &'static str = include_str!("./init.sql");
 
-    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         Self {
             conn: Connection::open_in_memory()?,
@@ -91,33 +108,30 @@ impl Database {
         Ok(self)
     }
 
-    // pub fn select_generations(&self) -> Result<Vec<Generation>> {
-    //     let mut stmt = self.conn.prepare_cached(
-    //         r"
-    //         SELECT * FROM generation
-    //             ORDER BY id DESC
-    //         ",
-    //     )?;
-    //     let ret = stmt
-    //         .query_map(NO_PARAMS, |row| {
-    //             Ok(Generation {
-    //                 id: row.get("id")?,
-    //                 start_time: row.get("start_time")?,
-    //                 end_time: row.get("end_time")?,
-    //                 channel_url: row.get("channel_url")?,
-    //                 cache_url: row.get("channel_url")?,
-    //                 git_revision: row.get("git_revision")?,
-    //                 total_paths: row.get("total_paths")?,
-    //                 total_file_size: row.get("total_file_size")?,
-    //                 status: row.get("status")?,
-    //             })
-    //         })?
-    //         .map(|r| r.map_err(Into::into))
-    //         .collect::<Result<Vec<_>>>()?;
-    //     Ok(ret)
-    // }
+    pub(crate) fn select_generations(&self) -> Result<Vec<Generation>> {
+        let mut stmt = self.conn.prepare_cached(
+            r"
+            SELECT * FROM generation
+                ORDER BY id DESC
+            ",
+        )?;
+        let ret = stmt
+            .query_map(NO_PARAMS, |row| {
+                Ok(Generation {
+                    id: row.get("id")?,
+                    start_time: row.get("start_time")?,
+                    end_time: row.get("end_time")?,
+                    cache_url: row.get("cache_url")?,
+                    extra_info: row.get("extra_info")?,
+                    status: row.get("status")?,
+                })
+            })?
+            .map(|r| r.map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ret)
+    }
 
-    pub fn select_all_nar_info(&self, mut f: impl FnMut(NarInfo)) -> Result<()> {
+    pub(crate) fn select_all_nar_info(&self, mut f: impl FnMut(NarInfo)) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
             r"
             SELECT hash, name, compression,
@@ -152,8 +166,55 @@ impl Database {
 
         Ok(())
     }
+
+    pub(crate) fn insert_generation(
+        &mut self,
+        cache_url: &str,
+        extra_info: &GenerationExtraInfo,
+        roots: impl IntoIterator<Item = StorePath>,
+    ) -> Result<i64> {
+        let txn = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        txn.execute_named(
+            r"
+            INSERT INTO generation
+                (cache_url, extra_info)
+                VALUES
+                (:cache_url, :extra_info)
+            ",
+            named_params! {
+                ":cache_url": cache_url,
+                ":extra_info": extra_info,
+            },
+        )?;
+        let gen_id = txn.last_insert_rowid();
+
+        let mut stmt = txn.prepare_cached(
+            r"
+            INSERT INTO generation_root
+                (generation_id, hash, name)
+                VALUES
+                (:generation_id, :hash, :name)
+            ",
+        )?;
+
+        for store_path in roots.into_iter() {
+            stmt.execute_named(named_params! {
+                ":generation_id": gen_id,
+                ":hash": store_path.hash,
+                ":name": store_path.name,
+            })?;
+        }
+
+        drop(stmt);
+        txn.commit()?;
+        Ok(gen_id)
+    }
 }
 
+// FIXME: More test
 #[cfg(test)]
 mod tests {
     use super::*;
