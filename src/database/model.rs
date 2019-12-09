@@ -41,6 +41,7 @@ pub struct Nar {
     pub status: NarStatus,
 }
 
+// https://github.com/NixOS/nix/blob/e5320a87ce75bbd2dd88f57c3b470a396195e849/src/libstore/schema.sql
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NarMeta {
@@ -54,6 +55,8 @@ pub struct NarMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deriver: Option<String>,
     pub sig: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,6 +90,9 @@ impl Nar {
                 if let Some(deriver) = &meta.deriver {
                     write!(f, "Deriver: {}\n", deriver)?;
                 }
+                if let Some(ca) = &meta.ca {
+                    write!(f, "CA: {}\n", ca)?;
+                }
 
                 Ok(())
             }
@@ -107,6 +113,7 @@ impl Nar {
             mut references,
             mut deriver,
             mut sig,
+            mut ca,
         ) = Default::default();
 
         for line in info.lines() {
@@ -130,6 +137,7 @@ impl Nar {
                 "References" => references = Some(v),
                 "Deriver" => deriver = Some(v),
                 "Sig" => sig = Some(v),
+                "CA" => ca = Some(v),
                 _ => return Err("Unknown field"),
             }
         }
@@ -146,6 +154,7 @@ impl Nar {
                 references: references.ok_or("Missing References")?.to_owned(),
                 deriver: deriver.map(|s| s.to_owned()),
                 sig: sig.ok_or("Missing Sig")?.to_owned(),
+                ca: ca.map(|s| s.to_owned()),
             },
             status,
         })
@@ -260,6 +269,7 @@ mod tests {
                 references: "ref1 ref2".to_owned(),
                 deriver: Some("some.drv".to_owned()),
                 sig: "s:i/g".to_owned(),
+                ca: Some("fixed:hash".to_owned()),
             },
             status: NarStatus::Pending,
         };
@@ -275,10 +285,12 @@ mod tests {
         References: ref1 ref2
         Sig: s:i/g
         Deriver: some.drv
+        CA: fixed:hash
         "###);
 
         nar.meta.references = String::new();
         nar.meta.deriver = None;
+        nar.meta.ca = None;
         assert_snapshot!(nar.format_nar_info().to_string(), @r###"
         StorePath: /nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10
         URL: some/url
@@ -305,6 +317,7 @@ NarSize: 456
 References: ref1 ref2
 Sig: s:i/g
 Deriver: some.drv
+CA: fixed:hash
 "###;
 
         let nar = Nar {
@@ -322,6 +335,7 @@ Deriver: some.drv
                 references: "ref1 ref2".to_owned(),
                 deriver: Some("some.drv".to_owned()),
                 sig: "s:i/g".to_owned(),
+                ca: Some("fixed:hash".to_owned()),
             },
             status: NarStatus::Pending,
         };
