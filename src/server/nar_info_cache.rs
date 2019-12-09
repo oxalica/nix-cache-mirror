@@ -1,5 +1,5 @@
 use crate::database::{Database, Error as DBError};
-use std::{collections::HashMap, convert::TryInto, ops::Range};
+use std::{collections::HashMap, ops::Range};
 
 const NAR_HASH_LEN: usize = 32;
 
@@ -21,14 +21,21 @@ impl NarInfoCache {
 
         let mut buf = String::new();
         let mut cache = HashMap::new();
-        db.select_all_nar_info(|info| {
+        db.select_all_nar(|nar| {
             let start = buf.len();
-            write!(&mut buf, "{}", info).unwrap();
+            write!(
+                &mut buf,
+                "{}",
+                nar.format_nar_info(format_args!("nar/{}", nar.store_path.hash_str())),
+            )
+            .unwrap();
+            let end = buf.len();
+
             cache.insert(
-                info.hash.as_bytes().try_into().unwrap(),
+                *nar.store_path.hash(),
                 CacheItem {
-                    info_range: start..buf.len(),
-                    file_size: info.file_size,
+                    info_range: start..end,
+                    file_size: nar.meta.file_size,
                 },
             );
         })?;

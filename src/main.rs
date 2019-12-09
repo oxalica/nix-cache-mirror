@@ -3,17 +3,18 @@ extern crate nix_cache_mirror;
 use env_logger;
 use futures::compat::Future01CompatExt as _;
 use hyper::{self, service::service_fn, Server};
-use nix_cache_mirror::{block_on, database::Database, server, update};
+use nix_cache_mirror::{block_on, database::Database, server};
 use std::{path::Path, sync::Arc};
 
 fn main() {
     env_logger::init();
 
     // add_channel();
-    add_raw_channel();
-    // serve();
+    // add_raw_channel();
+    serve();
 }
 
+/*
 fn add_channel() {
     let mut db = Database::open("./data/db.sqlite").unwrap();
     block_on(async move {
@@ -48,10 +49,11 @@ fn add_raw_channel() {
     )
     .unwrap();
 }
+*/
 
 fn serve() {
     let listen_addr = ([127, 0, 0, 1], 3000).into();
-    let db_path = Path::new("./data/db.sqlite");
+    let db_path = Path::new("./data/simple.sqlite");
     let nar_file_dir = Path::new("./data/nar").to_path_buf();
     let want_mass_query = true;
     let priority = Some(40);

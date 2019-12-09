@@ -2,7 +2,7 @@ use futures;
 
 pub mod database;
 pub mod server;
-pub mod update;
+// pub mod update;
 
 pub fn block_on(fut: impl std::future::Future<Output = ()> + Send + 'static) {
     use futures::TryFutureExt as _;

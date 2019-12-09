@@ -1,39 +1,33 @@
-use failure::Fail;
+use failure::{format_err, Fail};
 use rusqlite::{self, named_params, types, Connection, TransactionBehavior, NO_PARAMS};
-use serde_json;
 use static_assertions::*;
-use std::path::Path;
+use std::{convert::TryInto, path::Path};
 
 type Result<T> = std::result::Result<T, Error>;
 
 pub mod model;
-pub use self::model::*;
+use self::model::*;
 
-impl types::FromSql for GenerationStatus {
+impl types::FromSql for RootStatus {
     fn column_result(value: types::ValueRef) -> types::FromSqlResult<Self> {
         let v: String = types::FromSql::column_result(value)?;
         Ok(match &*v {
-            "canceled" => Self::Canceled,
             "pending" => Self::Pending,
-            "indexing" => Self::Indexing,
             "downloading" => Self::Downloading,
-            "finished" => Self::Finished,
-            _ => unreachable!(),
+            "available" => Self::Available,
+            s => panic!("Unknown RootStatus '{}'", s),
         })
     }
 }
 
-impl types::FromSql for GenerationExtraInfo {
+impl types::FromSql for NarStatus {
     fn column_result(value: types::ValueRef) -> types::FromSqlResult<Self> {
         let v: String = types::FromSql::column_result(value)?;
-        Ok(serde_json::from_str(&v).map_err(|err| types::FromSqlError::Other(Box::new(err)))?)
-    }
-}
-
-impl types::ToSql for GenerationExtraInfo {
-    fn to_sql(&self) -> rusqlite::Result<types::ToSqlOutput<'_>> {
-        let v = serde_json::to_string(self).unwrap();
-        Ok(types::ToSqlOutput::Owned(types::Value::Text(v)))
+        Ok(match &*v {
+            "pending" => Self::Pending,
+            "available" => Self::Available,
+            s => panic!("Unknown NarStatus '{}'", s),
+        })
     }
 }
 
@@ -45,6 +39,8 @@ pub enum Error {
     InvalidDatabase(String),
     #[fail(display = "Row not found")]
     NotFound,
+    #[fail(display = "Parse error: {}", 0)]
+    ParseError(failure::Error),
 }
 
 impl From<rusqlite::Error> for Error {
@@ -53,6 +49,12 @@ impl From<rusqlite::Error> for Error {
             rusqlite::Error::QueryReturnedNoRows => Self::NotFound,
             e => Self::SqliteError(e),
         }
+    }
+}
+
+impl From<std::num::TryFromIntError> for Error {
+    fn from(err: std::num::TryFromIntError) -> Self {
+        Self::ParseError(err.into())
     }
 }
 
@@ -108,7 +110,8 @@ impl Database {
         Ok(self)
     }
 
-    pub(crate) fn select_generations(&self) -> Result<Vec<Generation>> {
+    /*
+    pub(crate) fn select_roots(&self) -> Result<Vec<Generation>> {
         let mut stmt = self.conn.prepare_cached(
             r"
             SELECT * FROM generation
@@ -117,7 +120,7 @@ impl Database {
         )?;
         let ret = stmt
             .query_map(NO_PARAMS, |row| {
-                Ok(Generation {
+                Ok(Root {
                     id: row.get("id")?,
                     start_time: row.get("start_time")?,
                     end_time: row.get("end_time")?,
@@ -130,43 +133,34 @@ impl Database {
             .collect::<Result<Vec<_>>>()?;
         Ok(ret)
     }
+    */
 
-    pub(crate) fn select_all_nar_info(&self, mut f: impl FnMut(NarInfo)) -> Result<()> {
+    pub(crate) fn select_all_nar(&self, mut f: impl FnMut(Nar)) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
             r"
-            SELECT hash, name, compression,
-                    file_hash, file_size, nar_hash, nar_size,
-                    (SELECT group_concat(referenced.hash || '-' || referenced.name, ' ')
-                        FROM nar_reference AS rel
-                        JOIN nar_info AS referenced ON (referenced.id = rel.reference_id)
-                        WHERE rel.nar_id = nar_info.id
-                    ) AS refs,
-                    deriver, sig
-                FROM nar_info
-                WHERE available
+            SELECT store_path, meta, status
+                FROM nar
             ",
         )?;
 
-        stmt.query_and_then(NO_PARAMS, |row| {
-            Ok(NarInfo {
-                hash: row.get("hash")?,
-                name: row.get("name")?,
-                compression: row.get("compression")?,
-                file_hash: row.get("file_hash")?,
-                file_size: row.get::<_, i64>("file_size")? as u64,
-                nar_hash: row.get("nar_hash")?,
-                nar_size: row.get::<_, i64>("nar_size")? as u64,
-                references: row.get("refs")?,
-                deriver: row.get("deriver")?,
-                sig: row.get("sig")?,
+        stmt.query_and_then(NO_PARAMS, |row| -> Result<_> {
+            Ok(Nar {
+                store_path: row
+                    .get::<_, String>("store_path")?
+                    .try_into()
+                    .map_err(Error::ParseError)?,
+                meta: serde_json::from_str(&row.get::<_, String>("meta")?)
+                    .map_err(|err| Error::ParseError(format_err!("Invalid nar meta: {}", err)))?,
+                status: row.get("status")?,
             })
         })?
-        .map(|ret| ret.map(|info| f(info)))
+        .map(|r| r.map(&mut f))
         .collect::<Result<()>>()?;
 
         Ok(())
     }
 
+    /*
     pub(crate) fn insert_generation(
         &mut self,
         cache_url: &str,
@@ -212,6 +206,7 @@ impl Database {
         txn.commit()?;
         Ok(gen_id)
     }
+    */
 }
 
 // FIXME: More test
