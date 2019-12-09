@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS root (
 
     status TEXT NOT NULL
         DEFAULT ('pending')
-        CHECK (status IN ('pending', 'downloading', 'available'))
+        CHECK (status IN ('pending', 'indexed', 'downloading', 'available'))
 );
 
 CREATE TABLE IF NOT EXISTS root_nar (

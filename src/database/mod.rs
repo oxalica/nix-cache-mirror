@@ -1,5 +1,6 @@
 use failure::{format_err, Fail};
-use rusqlite::{self, named_params, types, Connection, TransactionBehavior, NO_PARAMS};
+use rusqlite::{self, named_params, params, types, Connection, TransactionBehavior, NO_PARAMS};
+use serde_json::{self, Value as JsonValue};
 use static_assertions::*;
 use std::{convert::TryInto, path::Path};
 
@@ -13,10 +14,23 @@ impl types::FromSql for RootStatus {
         let v: String = types::FromSql::column_result(value)?;
         Ok(match &*v {
             "pending" => Self::Pending,
+            "indexed" => Self::Indexed,
             "downloading" => Self::Downloading,
             "available" => Self::Available,
             s => panic!("Unknown RootStatus '{}'", s),
         })
+    }
+}
+
+impl types::ToSql for RootStatus {
+    fn to_sql(&self) -> rusqlite::Result<types::ToSqlOutput<'_>> {
+        match self {
+            RootStatus::Pending => "pending",
+            RootStatus::Indexed => "indexed",
+            RootStatus::Downloading => "downloading",
+            RootStatus::Available => "available",
+        }
+        .to_sql()
     }
 }
 
@@ -28,6 +42,16 @@ impl types::FromSql for NarStatus {
             "available" => Self::Available,
             s => panic!("Unknown NarStatus '{}'", s),
         })
+    }
+}
+
+impl types::ToSql for NarStatus {
+    fn to_sql(&self) -> rusqlite::Result<types::ToSqlOutput<'_>> {
+        match self {
+            NarStatus::Pending => "pending",
+            NarStatus::Available => "available",
+        }
+        .to_sql()
     }
 }
 
@@ -134,6 +158,96 @@ impl Database {
         Ok(ret)
     }
     */
+
+    pub(crate) fn insert_root(
+        &mut self,
+        meta: &JsonValue,
+        status: RootStatus,
+        root_nar_ids: impl IntoIterator<Item = i64>,
+    ) -> Result<i64> {
+        let txn = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        txn.execute_named(
+            r"
+            INSERT INTO root
+                (meta, status)
+                VALUES
+                (:meta, :status)
+            ",
+            named_params! {
+                ":meta": meta,
+                ":status": status,
+            },
+        )?;
+        let root_id = txn.last_insert_rowid();
+
+        let mut stmt = txn.prepare_cached(
+            r"
+            INSERT INTO root_nar
+                (root_id, nar_id)
+                VALUES
+                (:root_id, :nar_id)
+            ",
+        )?;
+
+        for nar_id in root_nar_ids {
+            stmt.execute_named(named_params! {
+                ":root_id": root_id,
+                ":nar_id": nar_id,
+            })?;
+        }
+
+        drop(stmt);
+        txn.commit()?;
+        Ok(root_id)
+    }
+
+    pub(crate) fn insert_or_ignore_nar(
+        &mut self,
+        nars: impl IntoIterator<Item = Nar>,
+    ) -> Result<Vec<i64>> {
+        let txn = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let mut stmt_insert = txn.prepare_cached(
+            r"
+            INSERT OR IGNORE INTO nar
+                (store_path, meta, status)
+                VALUES
+                (:store_path, :meta, :status)
+            ",
+        )?;
+
+        let mut stmt_select = txn.prepare_cached(
+            r"
+            SELECT id
+                FROM nar
+                WHERE store_path = ?
+            ",
+        )?;
+
+        let mut ids = vec![];
+        for nar in nars {
+            let ret = stmt_insert.execute_named(named_params! {
+                ":store_path": nar.store_path.path(),
+                ":meta": serde_json::to_string(&nar.meta).unwrap(),
+                ":status": nar.status,
+            });
+            let nar_id = match ret {
+                Ok(0) => stmt_select.query_row(params![nar.store_path.path()], |row| row.get(0))?,
+                Ok(_) => txn.last_insert_rowid(),
+                Err(err) => return Err(err.into()),
+            };
+            ids.push(nar_id);
+        }
+
+        drop(stmt_select);
+        drop(stmt_insert);
+        txn.commit()?;
+        Ok(ids)
+    }
 
     pub(crate) fn select_all_nar(&self, mut f: impl FnMut(Nar)) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(

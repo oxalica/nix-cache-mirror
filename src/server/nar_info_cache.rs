@@ -21,14 +21,11 @@ impl NarInfoCache {
 
         let mut buf = String::new();
         let mut cache = HashMap::new();
-        db.select_all_nar(|nar| {
+        db.select_all_nar(|mut nar| {
+            nar.meta.url = format!("nar/{}", nar.store_path.hash_str());
+
             let start = buf.len();
-            write!(
-                &mut buf,
-                "{}",
-                nar.format_nar_info(format_args!("nar/{}", nar.store_path.hash_str())),
-            )
-            .unwrap();
+            write!(&mut buf, "{}", nar.format_nar_info()).unwrap();
             let end = buf.len();
 
             cache.insert(
