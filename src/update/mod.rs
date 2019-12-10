@@ -8,6 +8,7 @@ use futures::{
     compat::{Future01CompatExt as _, Stream01CompatExt as _},
     prelude::*,
 };
+use futures_intrusive::sync::Semaphore;
 use lazy_static::lazy_static;
 use log;
 use reqwest::{
@@ -19,21 +20,21 @@ use std::{convert::TryFrom, env};
 use tokio::timer;
 use xz2;
 
-mod semaphore;
-
 type Result<T> = std::result::Result<T, Error>;
 
 lazy_static! {
     static ref CLIENT: Client = {
         let mut b = ClientBuilder::new();
         if let Ok(proxy) = env::var("https_proxy").or(env::var("HTTPS_PROXY")) {
-            b = b.proxy(Proxy::https(&proxy).expect("Invalid https proxy"));
+            b = b.proxy(Proxy::https(&proxy).expect("Invalid https_proxy"));
+        }
+        if let Ok(proxy) = env::var("http_proxy").or(env::var("HTTP_PROXY")) {
+            b = b.proxy(Proxy::https(&proxy).expect("Invalid http_proxy"));
+        }
+        if let Ok(proxy) = env::var("all_proxy").or(env::var("ALL_PROXY")) {
+            b = b.proxy(Proxy::all(&proxy).expect("Invalid all_proxy"));
         }
         b.build().expect("Cannot build reqwest client")
-        // ClientBuilder::new()
-        //     .use_sys_proxy()
-        //     .build()
-        //     .expect("Cannot build reqwest client")
     };
 }
 
@@ -173,14 +174,14 @@ async fn fetch_meta_rec(
     struct QueueData(Nar, mpsc::Sender<QueueData>);
 
     async fn fetcher(
-        semaphore: Arc<semaphore::Semaphore>,
+        semaphore: Arc<Semaphore>,
         cache_url: Arc<str>,
         hash: String,
         queue: mpsc::Sender<QueueData>,
     ) {
         let ret: Result<()> = async {
             let info_url = format!("{}/{}.narinfo", cache_url, hash);
-            let guard = semaphore.acquire().await;
+            let guard = semaphore.acquire(1).await;
             let resp = get_all_to_string(&info_url).await?;
             drop(guard);
 
@@ -237,7 +238,7 @@ async fn fetch_meta_rec(
     let (tx, mut rx) = mpsc::channel(chan_len);
 
     const MAX_CONCURRENT_FETCH: usize = 128;
-    let semaphore = Arc::new(semaphore::Semaphore::new(MAX_CONCURRENT_FETCH));
+    let semaphore = Arc::new(Semaphore::new(false, MAX_CONCURRENT_FETCH));
 
     // Some(nar) for fetched.
     // None      for fetching.
