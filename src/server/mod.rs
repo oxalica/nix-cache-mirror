@@ -180,7 +180,10 @@ fn serve_nar_file(data: &ServerData, req: &Request, hash: &str, head_only: bool)
 }
 
 async fn send_file(path: PathBuf, mut tx: hyper::body::Sender, range: Range<u64>) {
-    use async_std::{fs::File, io::prelude::*, io::SeekFrom};
+    use async_std::{
+        fs::File,
+        io::{prelude::*, SeekFrom},
+    };
     use futures01::Async as Async01;
     use std::{
         future::Future,

@@ -26,20 +26,17 @@ fn add_channel() {
 fn add_raw_channel() {
     use nix_cache_mirror::database::model::*;
     use std::convert::TryFrom;
-    use update::NixChannelInfo;
 
     let mut db = Database::open("./data/raw.sqlite").unwrap();
     block_on(async move {
         let ids = update::add_root_rec(
             &mut db,
-            NixChannelInfo {
-                cache_url: "https://cache.nixos.org".to_owned(),
-                root_paths: vec![StorePath::try_from(
-                    "/nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10".to_owned(),
-                )
-                .unwrap()],
-                meta: serde_json::json!({}),
-            },
+            &Root::default(),
+            "https://cache.nixos.org",
+            vec![
+                StorePath::try_from("/nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10")
+                    .unwrap(),
+            ],
         )
         .await
         .unwrap();

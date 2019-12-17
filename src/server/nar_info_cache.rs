@@ -1,12 +1,13 @@
-use crate::database::{Database, Error as DBError};
+use crate::database::{
+    model::{NarStatus, StorePathHash},
+    Database, Error as DBError,
+};
 use std::{collections::HashMap, ops::Range};
-
-const NAR_HASH_LEN: usize = 32;
 
 #[derive(Debug)]
 pub struct NarInfoCache {
     buf: String,
-    cache: HashMap<[u8; NAR_HASH_LEN], CacheItem>,
+    cache: HashMap<StorePathHash, CacheItem>,
 }
 
 #[derive(Debug)]
@@ -21,7 +22,7 @@ impl NarInfoCache {
 
         let mut buf = String::new();
         let mut cache = HashMap::new();
-        db.select_all_nar(|mut nar| {
+        db.select_all_nar(NarStatus::Available, |_, mut nar| {
             nar.meta.url = format!("nar/{}", nar.store_path.hash_str());
 
             let start = buf.len();
@@ -29,10 +30,10 @@ impl NarInfoCache {
             let end = buf.len();
 
             cache.insert(
-                *nar.store_path.hash(),
+                nar.store_path.hash(),
                 CacheItem {
                     info_range: start..end,
-                    file_size: nar.meta.file_size,
+                    file_size: nar.meta.file_size.unwrap_or(nar.meta.nar_size),
                 },
             );
         })?;
@@ -41,7 +42,7 @@ impl NarInfoCache {
     }
 
     pub fn get_info(&self, hash: &str) -> Option<&str> {
-        if hash.len() != NAR_HASH_LEN {
+        if hash.len() != StorePathHash::LEN {
             return None;
         }
         self.cache
@@ -50,7 +51,7 @@ impl NarInfoCache {
     }
 
     pub fn get_file_size(&self, hash: &str) -> Option<u64> {
-        if hash.len() != NAR_HASH_LEN {
+        if hash.len() != StorePathHash::LEN {
             return None;
         }
         self.cache.get(hash.as_bytes()).map(|item| item.file_size)

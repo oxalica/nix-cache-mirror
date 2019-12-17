@@ -1,99 +1,107 @@
-use failure::Error;
-use ifmt::iwrite;
+use chrono::{DateTime, Utc};
+use failure::{format_err, Error};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
-use std::{convert::TryFrom, fmt};
+use std::{borrow::Borrow, convert::TryFrom, fmt};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Root {
-    pub id: i64,
-    pub meta: JsonValue,
+    pub channel_url: Option<String>,
+    pub cache_url: Option<String>,
+    pub git_revision: Option<String>,
+    pub fetch_time: Option<DateTime<Utc>>,
     pub status: RootStatus,
 }
 
-/*
-#[derive(Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RootMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub channel_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_paths: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total_file_size: Option<i64>,
-}
-*/
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RootStatus {
     Pending,
-    Indexed,
     Downloading,
     Available,
+}
+
+impl Default for RootStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Nar {
     pub store_path: StorePath,
     pub meta: NarMeta,
-    pub status: NarStatus,
+    pub references: String,
 }
 
-// https://github.com/NixOS/nix/blob/e5320a87ce75bbd2dd88f57c3b470a396195e849/src/libstore/schema.sql
+// https://github.com/NixOS/nix/blob/61e816217bfdfffd39c130c7cd24f07e640098fc/src/libstore/schema.sql
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NarMeta {
-    pub compression: String,
     pub url: String,
-    pub file_hash: String,
-    pub file_size: u64,
+
+    pub compression: Option<String>,
+    pub file_hash: Option<String>,
+    pub file_size: Option<u64>,
     pub nar_hash: String,
     pub nar_size: u64,
-    pub references: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deriver: Option<String>,
-    pub sig: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum NarStatus {
     Pending,
     Available,
+    Trashed,
+}
+
+impl Default for NarStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
 }
 
 impl Nar {
+    pub fn ref_paths(&self) -> impl Iterator<Item = Result<StorePath, Error>> + '_ {
+        // Yield nothing on empty string.
+        self.references.split_terminator(" ").map(move |basename| {
+            StorePath::try_from(format!("{}/{}", self.store_path.root(), basename))
+        })
+    }
+
     pub fn format_nar_info<'a>(&'a self) -> impl fmt::Display + 'a {
         struct Fmt<'a>(&'a Nar);
 
         impl fmt::Display for Fmt<'_> {
             fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 let (nar, meta) = (&self.0, &self.0.meta);
-
-                iwrite!(
-                    f,
-                    "StorePath: {nar.store_path}\n\
-                     URL: {meta.url}\n\
-                     Compression: {meta.compression}\n\
-                     FileHash: {meta.file_hash}\n\
-                     FileSize: {meta.file_size}\n\
-                     NarHash: {meta.nar_hash}\n\
-                     NarSize: {meta.nar_size}\n\
-                     References: {meta.references}\n\
-                     Sig: {meta.sig}\n\
-                     "
-                )?;
-
+                write!(f, "StorePath: {}\n", nar.store_path)?;
+                write!(f, "URL: {}\n", meta.url)?;
+                if let Some(comp) = &meta.compression {
+                    write!(f, "Compression: {}\n", comp)?;
+                }
+                if let Some(hash) = &meta.file_hash {
+                    write!(f, "FileHash: {}\n", hash)?;
+                }
+                if let Some(size) = &meta.file_size {
+                    write!(f, "FileSize: {}\n", size)?;
+                }
+                write!(f, "NarHash: {}\n", meta.nar_hash)?;
+                write!(f, "NarSize: {}\n", meta.nar_size)?;
+                write!(f, "References: {}\n", nar.references)?;
+                if let Some(sig) = &meta.sig {
+                    write!(f, "Sig: {}\n", sig)?;
+                }
                 if let Some(deriver) = &meta.deriver {
                     write!(f, "Deriver: {}\n", deriver)?;
                 }
                 if let Some(ca) = &meta.ca {
                     write!(f, "CA: {}\n", ca)?;
                 }
-
                 Ok(())
             }
         }
@@ -101,7 +109,11 @@ impl Nar {
         Fmt(self)
     }
 
-    pub fn parse_nar_info(info: &str, status: NarStatus) -> Result<Self, &'static str> {
+    pub fn parse_nar_info(info: &str) -> Result<Self, Error> {
+        Self::parse_nar_info_inner(info).map_err(|err| format_err!("Invalid narinfo: {}", err))
+    }
+
+    fn parse_nar_info_inner(info: &str) -> Result<Self, &'static str> {
         let (
             mut store_path,
             mut url,
@@ -125,8 +137,7 @@ impl Nar {
             let (k, v) = (&line[..sep], &line[sep + 2..]);
             match k {
                 "StorePath" => {
-                    store_path =
-                        Some(StorePath::try_from(v.to_owned()).map_err(|_| "Invalid StorePath")?);
+                    store_path = Some(StorePath::try_from(v).map_err(|_| "Invalid StorePath")?);
                 }
                 "URL" => url = Some(v),
                 "Compression" => compression = Some(v),
@@ -145,19 +156,49 @@ impl Nar {
         Ok(Nar {
             store_path: store_path.ok_or("Missing StorePath")?,
             meta: NarMeta {
-                compression: compression.ok_or("Missing StorePath")?.to_owned(),
+                compression: compression.map(|s| s.to_owned()),
                 url: url.ok_or("Missing URL")?.to_owned(),
-                file_hash: file_hash.ok_or("Missing FileHash")?.to_owned(),
-                file_size: file_size.ok_or("Missing FileSize")?,
+                file_hash: file_hash.map(|s| s.to_owned()),
+                file_size: file_size,
                 nar_hash: nar_hash.ok_or("Missing NarHash")?.to_owned(),
                 nar_size: nar_size.ok_or("Missing NarSize")?,
-                references: references.ok_or("Missing References")?.to_owned(),
                 deriver: deriver.map(|s| s.to_owned()),
-                sig: sig.ok_or("Missing Sig")?.to_owned(),
+                sig: sig.map(|s| s.to_owned()),
                 ca: ca.map(|s| s.to_owned()),
             },
-            status,
+            references: references.ok_or("Missing References")?.to_owned(),
         })
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct StorePathHash([u8; Self::LEN]);
+
+impl StorePathHash {
+    pub const LEN: usize = 32;
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap()
+    }
+}
+
+impl fmt::Display for StorePathHash {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl fmt::Debug for StorePathHash {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("StorePathHash")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl Borrow<[u8]> for StorePathHash {
+    fn borrow(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -166,10 +207,10 @@ pub struct StorePath {
     path: String,
 }
 
+// FIXME: Allow non-default store root.
 impl StorePath {
     const STORE_PREFIX: &'static str = "/nix/store/";
-    pub const STORE_HASH_LEN: usize = 32;
-    const SEP_POS: usize = Self::STORE_PREFIX.len() + Self::STORE_HASH_LEN;
+    const SEP_POS: usize = Self::STORE_PREFIX.len() + StorePathHash::LEN;
     const MIN_LEN: usize = Self::SEP_POS + 1 + 1;
     const MAX_LEN: usize = 212;
 
@@ -177,17 +218,21 @@ impl StorePath {
         &self.path
     }
 
+    pub fn root(&self) -> &str {
+        &Self::STORE_PREFIX[..Self::STORE_PREFIX.len() - 1]
+    }
+
     pub fn hash_str(&self) -> &str {
         &self.path[Self::STORE_PREFIX.len()..Self::SEP_POS]
     }
 
-    pub fn hash(&self) -> &[u8; Self::STORE_HASH_LEN] {
-        use std::convert::TryInto;
-
-        self.path[Self::STORE_PREFIX.len()..Self::SEP_POS]
-            .as_bytes()
-            .try_into()
-            .unwrap()
+    pub fn hash(&self) -> StorePathHash {
+        StorePathHash(
+            <[u8; StorePathHash::LEN]>::try_from(
+                self.path[Self::STORE_PREFIX.len()..Self::SEP_POS].as_bytes(),
+            )
+            .unwrap(),
+        )
     }
 
     pub fn name(&self) -> &str {
@@ -241,6 +286,14 @@ impl TryFrom<String> for StorePath {
     }
 }
 
+impl TryFrom<&'_ str> for StorePath {
+    type Error = Error;
+
+    fn try_from(path: &'_ str) -> Result<Self, Self::Error> {
+        Self::try_from(path.to_owned())
+    }
+}
+
 impl fmt::Display for StorePath {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(self.path(), f)
@@ -256,22 +309,21 @@ mod tests {
     fn test_nar_info_format() {
         let mut nar = Nar {
             store_path: StorePath::try_from(
-                "/nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10".to_owned(),
+                "/nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10",
             )
             .unwrap(),
             meta: NarMeta {
                 url: "some/url".to_owned(),
-                compression: "xz".to_owned(),
-                file_hash: "file:hash".to_owned(),
-                file_size: 123,
+                compression: Some("xz".to_owned()),
+                file_hash: Some("file:hash".to_owned()),
+                file_size: Some(123),
                 nar_hash: "nar:hash".to_owned(),
                 nar_size: 456,
-                references: "ref1 ref2".to_owned(),
                 deriver: Some("some.drv".to_owned()),
-                sig: "s:i/g".to_owned(),
+                sig: Some("s:i/g 2".to_owned()),
                 ca: Some("fixed:hash".to_owned()),
             },
-            status: NarStatus::Pending,
+            references: "ref1 ref2".to_owned(),
         };
 
         assert_snapshot!(nar.format_nar_info().to_string(), @r###"
@@ -283,12 +335,12 @@ mod tests {
         NarHash: nar:hash
         NarSize: 456
         References: ref1 ref2
-        Sig: s:i/g
+        Sig: s:i/g 2
         Deriver: some.drv
         CA: fixed:hash
         "###);
 
-        nar.meta.references = String::new();
+        nar.references = String::new();
         nar.meta.deriver = None;
         nar.meta.ca = None;
         assert_snapshot!(nar.format_nar_info().to_string(), @r###"
@@ -300,7 +352,7 @@ mod tests {
         NarHash: nar:hash
         NarSize: 456
         References: 
-        Sig: s:i/g
+        Sig: s:i/g 2
         "###);
     }
 
@@ -315,31 +367,30 @@ FileSize: 123
 NarHash: nar:hash
 NarSize: 456
 References: ref1 ref2
-Sig: s:i/g
+Sig: s:i/g 2
 Deriver: some.drv
 CA: fixed:hash
 "###;
 
         let nar = Nar {
             store_path: StorePath::try_from(
-                "/nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10".to_owned(),
+                "/nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10",
             )
             .unwrap(),
             meta: NarMeta {
                 url: "some/url".to_owned(),
-                compression: "xz".to_owned(),
-                file_hash: "file:hash".to_owned(),
-                file_size: 123,
+                compression: Some("xz".to_owned()),
+                file_hash: Some("file:hash".to_owned()),
+                file_size: Some(123),
                 nar_hash: "nar:hash".to_owned(),
                 nar_size: 456,
-                references: "ref1 ref2".to_owned(),
                 deriver: Some("some.drv".to_owned()),
-                sig: "s:i/g".to_owned(),
+                sig: Some("s:i/g 2".to_owned()),
                 ca: Some("fixed:hash".to_owned()),
             },
-            status: NarStatus::Pending,
+            references: "ref1 ref2".to_owned(),
         };
 
-        assert_eq!(Nar::parse_nar_info(raw, NarStatus::Pending), Ok(nar));
+        assert_eq!(Nar::parse_nar_info(raw).unwrap(), nar);
     }
 }

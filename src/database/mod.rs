@@ -1,6 +1,6 @@
-use failure::{format_err, Fail};
+use chrono::SecondsFormat;
+use failure::Fail;
 use rusqlite::{self, named_params, params, types, Connection, TransactionBehavior, NO_PARAMS};
-use serde_json::{self, Value as JsonValue};
 use static_assertions::*;
 use std::{convert::TryInto, path::Path};
 
@@ -13,10 +13,9 @@ impl types::FromSql for RootStatus {
     fn column_result(value: types::ValueRef) -> types::FromSqlResult<Self> {
         let v: String = types::FromSql::column_result(value)?;
         Ok(match &*v {
-            "pending" => Self::Pending,
-            "indexed" => Self::Indexed,
-            "downloading" => Self::Downloading,
-            "available" => Self::Available,
+            "P" => Self::Pending,
+            "D" => Self::Downloading,
+            "A" => Self::Available,
             s => panic!("Unknown RootStatus '{}'", s),
         })
     }
@@ -25,10 +24,9 @@ impl types::FromSql for RootStatus {
 impl types::ToSql for RootStatus {
     fn to_sql(&self) -> rusqlite::Result<types::ToSqlOutput<'_>> {
         match self {
-            RootStatus::Pending => "pending",
-            RootStatus::Indexed => "indexed",
-            RootStatus::Downloading => "downloading",
-            RootStatus::Available => "available",
+            RootStatus::Pending => "P",
+            RootStatus::Downloading => "D",
+            RootStatus::Available => "A",
         }
         .to_sql()
     }
@@ -38,8 +36,9 @@ impl types::FromSql for NarStatus {
     fn column_result(value: types::ValueRef) -> types::FromSqlResult<Self> {
         let v: String = types::FromSql::column_result(value)?;
         Ok(match &*v {
-            "pending" => Self::Pending,
-            "available" => Self::Available,
+            "P" => Self::Pending,
+            "A" => Self::Available,
+            "T" => Self::Trashed,
             s => panic!("Unknown NarStatus '{}'", s),
         })
     }
@@ -48,8 +47,9 @@ impl types::FromSql for NarStatus {
 impl types::ToSql for NarStatus {
     fn to_sql(&self) -> rusqlite::Result<types::ToSqlOutput<'_>> {
         match self {
-            NarStatus::Pending => "pending",
-            NarStatus::Available => "available",
+            NarStatus::Pending => "P",
+            NarStatus::Available => "A",
+            NarStatus::Trashed => "T",
         }
         .to_sql()
     }
@@ -93,6 +93,7 @@ impl Database {
     const APPLICATION_ID: i32 = 0x2237186b;
     const USER_VERSION: i32 = 1;
     const INIT_SQL: &'static str = include_str!("./init.sql");
+    const RUN_SQL: &'static str = include_str!("./run.sql");
 
     pub fn open_in_memory() -> Result<Self> {
         Self {
@@ -131,38 +132,13 @@ impl Database {
                 (app_id, user_ver),
             )));
         }
+        self.conn.execute_batch(Self::RUN_SQL)?;
         Ok(self)
     }
 
-    /*
-    pub(crate) fn select_roots(&self) -> Result<Vec<Generation>> {
-        let mut stmt = self.conn.prepare_cached(
-            r"
-            SELECT * FROM generation
-                ORDER BY id DESC
-            ",
-        )?;
-        let ret = stmt
-            .query_map(NO_PARAMS, |row| {
-                Ok(Root {
-                    id: row.get("id")?,
-                    start_time: row.get("start_time")?,
-                    end_time: row.get("end_time")?,
-                    cache_url: row.get("cache_url")?,
-                    extra_info: row.get("extra_info")?,
-                    status: row.get("status")?,
-                })
-            })?
-            .map(|r| r.map_err(Into::into))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(ret)
-    }
-    */
-
     pub(crate) fn insert_root(
         &mut self,
-        meta: &JsonValue,
-        status: RootStatus,
+        root: &Root,
         root_nar_ids: impl IntoIterator<Item = i64>,
     ) -> Result<i64> {
         let txn = self
@@ -171,13 +147,19 @@ impl Database {
         txn.execute_named(
             r"
             INSERT INTO root
-                (meta, status)
+                (channel_url, cache_url, git_revision, fetch_time, status)
                 VALUES
-                (:meta, :status)
+                (:channel_url, :cache_url, :git_revision, :fetch_time, :status)
             ",
             named_params! {
-                ":meta": meta,
-                ":status": status,
+                ":channel_url": root.channel_url,
+                ":cache_url": root.cache_url,
+                ":git_revision": root.git_revision,
+                ":fetch_time": root
+                    .fetch_time
+                    .as_ref()
+                    .map(|t| t.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                ":status": root.status,
             },
         )?;
         let root_id = txn.last_insert_rowid();
@@ -203,124 +185,148 @@ impl Database {
         Ok(root_id)
     }
 
-    pub(crate) fn insert_or_ignore_nar(
-        &mut self,
-        nars: impl IntoIterator<Item = Nar>,
-    ) -> Result<Vec<i64>> {
+    /// References must be already present in database.
+    pub(crate) fn insert_or_ignore_nar(&mut self, nar: &Nar, status: NarStatus) -> Result<i64> {
         let txn = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let mut stmt_insert = txn.prepare_cached(
+        let ret = txn.execute_named(
             r"
-            INSERT OR IGNORE INTO nar
-                (store_path, meta, status)
+            INSERT INTO nar
+                ( store_root, hash, name
+                , url, compression
+                , file_hash, file_size, nar_hash, nar_size
+                , deriver, sig, ca
+                , status )
                 VALUES
-                (:store_path, :meta, :status)
-            ",
-        )?;
-
-        let mut stmt_select = txn.prepare_cached(
-            r"
-            SELECT id
-                FROM nar
-                WHERE store_path = ?
-            ",
-        )?;
-
-        let mut ids = vec![];
-        for nar in nars {
-            let ret = stmt_insert.execute_named(named_params! {
-                ":store_path": nar.store_path.path(),
-                ":meta": serde_json::to_string(&nar.meta).unwrap(),
-                ":status": nar.status,
-            });
-            let nar_id = match ret {
-                Ok(0) => stmt_select.query_row(params![nar.store_path.path()], |row| row.get(0))?,
-                Ok(_) => txn.last_insert_rowid(),
-                Err(err) => return Err(err.into()),
-            };
-            ids.push(nar_id);
-        }
-
-        drop(stmt_select);
-        drop(stmt_insert);
-        txn.commit()?;
-        Ok(ids)
-    }
-
-    pub(crate) fn select_all_nar(&self, mut f: impl FnMut(Nar)) -> Result<()> {
-        let mut stmt = self.conn.prepare_cached(
-            r"
-            SELECT store_path, meta, status
-                FROM nar
-            ",
-        )?;
-
-        stmt.query_and_then(NO_PARAMS, |row| -> Result<_> {
-            Ok(Nar {
-                store_path: row
-                    .get::<_, String>("store_path")?
-                    .try_into()
-                    .map_err(Error::ParseError)?,
-                meta: serde_json::from_str(&row.get::<_, String>("meta")?)
-                    .map_err(|err| Error::ParseError(format_err!("Invalid nar meta: {}", err)))?,
-                status: row.get("status")?,
-            })
-        })?
-        .map(|r| r.map(&mut f))
-        .collect::<Result<()>>()?;
-
-        Ok(())
-    }
-
-    /*
-    pub(crate) fn insert_generation(
-        &mut self,
-        cache_url: &str,
-        extra_info: &GenerationExtraInfo,
-        roots: impl IntoIterator<Item = StorePath>,
-    ) -> Result<i64> {
-        let txn = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        txn.execute_named(
-            r"
-            INSERT INTO generation
-                (cache_url, extra_info)
-                VALUES
-                (:cache_url, :extra_info)
+                ( :store_root, :hash, :name
+                , :url, :compression
+                , :file_hash, :file_size, :nar_hash, :nar_size
+                , :deriver, :sig, :ca
+                , :status )
+                ON CONFLICT DO NOTHING
             ",
             named_params! {
-                ":cache_url": cache_url,
-                ":extra_info": extra_info,
+                ":store_root": nar.store_path.root(),
+                ":hash": nar.store_path.hash_str(),
+                ":name": nar.store_path.name(),
+
+                ":url": nar.meta.url,
+                ":compression": nar.meta.compression,
+
+                ":file_hash": nar.meta.file_hash,
+                ":file_size": nar.meta.file_size.map(|s| s as i64),
+                ":nar_hash": nar.meta.nar_hash,
+                ":nar_size": nar.meta.nar_size as i64,
+
+                ":deriver": nar.meta.deriver,
+                ":sig": nar.meta.sig,
+                ":ca": nar.meta.ca,
+
+                ":status": status,
             },
-        )?;
-        let gen_id = txn.last_insert_rowid();
+        );
+
+        let nar_id: i64 = match ret {
+            Ok(0) => {
+                return Ok(txn.query_row(
+                    r"SELECT id FROM nar WHERE hash = ?",
+                    params![nar.store_path.hash().as_str()],
+                    |row| Ok(row.get(0)?),
+                )?);
+            }
+            Ok(1) => txn.last_insert_rowid(),
+            Ok(_) => unreachable!(),
+            Err(err) => return Err(err.into()),
+        };
 
         let mut stmt = txn.prepare_cached(
             r"
-            INSERT INTO generation_root
-                (generation_id, hash, name)
-                VALUES
-                (:generation_id, :hash, :name)
+            INSERT INTO nar_ref
+                (nar_id, ref_id)
+            SELECT :nar_id, id
+                FROM nar
+                WHERE hash = :hash
             ",
         )?;
-
-        for store_path in roots.into_iter() {
+        for ref_path in nar.ref_paths() {
             stmt.execute_named(named_params! {
-                ":generation_id": gen_id,
-                ":hash": store_path.hash,
-                ":name": store_path.name,
+                ":nar_id": nar_id,
+                ":hash": ref_path.expect("Nar should be valid for database").hash_str(),
             })?;
         }
 
         drop(stmt);
         txn.commit()?;
-        Ok(gen_id)
+        Ok(nar_id)
     }
-    */
+
+    pub(crate) fn select_nar_id_by_hash(&self, hash: &StorePathHash) -> Result<Option<i64>> {
+        match self.conn.query_row_and_then(
+            r"SELECT id FROM nar WHERE hash = ? AND status != 'T'",
+            params![hash.as_str()],
+            |row| Ok(row.get(0)?),
+        ) {
+            Ok(id) => Ok(Some(id)),
+            Err(Error::NotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub(crate) fn select_all_nar(
+        &self,
+        status: NarStatus,
+        mut f: impl FnMut(i64, Nar),
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare_cached(
+            r"
+            SELECT  id, store_root, hash, name,
+                    url, compression,
+                    file_hash, file_size, nar_hash, nar_size,
+                    deriver, sig, ca,
+                    (SELECT COALESCE(GROUP_CONCAT(ref.hash || '-' || ref.name, ' '), '')
+                        FROM nar_ref
+                        JOIN nar AS ref ON ref.id = ref_id
+                        WHERE nar_id = nar.id
+                    ) AS refs
+                FROM nar
+                WHERE status = ?
+            ",
+        )?;
+
+        stmt.query_and_then(params![status], |row| -> Result<_> {
+            Ok((
+                row.get("id")?,
+                Nar {
+                    store_path: format!(
+                        "{}/{}-{}",
+                        row.get::<_, String>("store_root")?,
+                        row.get::<_, String>("hash")?,
+                        row.get::<_, String>("name")?,
+                    )
+                    .try_into()
+                    .map_err(Error::ParseError)?,
+                    meta: NarMeta {
+                        url: row.get("url")?,
+                        compression: row.get("compression")?,
+                        file_hash: row.get("file_hash")?,
+                        file_size: row.get::<_, Option<i64>>("file_size")?.map(|s| s as u64),
+                        nar_hash: row.get("nar_hash")?,
+                        nar_size: row.get::<_, i64>("nar_size")? as u64,
+                        deriver: row.get("deriver")?,
+                        sig: row.get("sig")?,
+                        ca: row.get("ca")?,
+                    },
+                    references: row.get("refs")?,
+                },
+            ))
+        })?
+        .map(|r| r.map(|(id, nar)| f(id, nar)))
+        .collect::<Result<()>>()?;
+
+        Ok(())
+    }
 }
 
 // FIXME: More test
