@@ -5,6 +5,7 @@ use tokio;
 pub mod database;
 pub mod server;
 pub mod update;
+mod util;
 
 pub fn block_on(fut: impl std::future::Future<Output = ()> + Send + 'static) {
     use std::sync::{

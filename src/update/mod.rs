@@ -1,14 +1,10 @@
-use crate::{
-    database::{model::*, Database, Error as DBError},
-    spawn,
-};
+use crate::database::{model::*, Database};
 use chrono::{DateTime, Utc};
 use failure::{ensure, format_err, Error, ResultExt as _};
 use futures::{
     compat::{Future01CompatExt as _, Stream01CompatExt as _},
     prelude::*,
 };
-use futures_intrusive::sync::Semaphore;
 use lazy_static::lazy_static;
 use log;
 use reqwest::{
@@ -16,7 +12,6 @@ use reqwest::{
     Proxy,
 };
 use std::{convert::TryFrom, env};
-use tokio::timer;
 use xz2;
 
 mod fetch_meta_rec;

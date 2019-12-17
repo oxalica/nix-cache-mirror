@@ -2,5 +2,7 @@
 **/*.rs.bk
 /.vscode
 **/*.pending-snap
+perf.data
+flamegraph.svg
 
 /data

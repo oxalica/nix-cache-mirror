@@ -1,32 +1,18 @@
 use crate::{
-    database::{model::*, Database, Error as DBError},
+    database::{model::*, Database},
     spawn,
+    util::Semaphore,
 };
-use chrono::{DateTime, Utc};
-use failure::{ensure, format_err, Error, ResultExt as _};
+use failure::{ensure, format_err, ResultExt as _};
 use futures::{
     channel::{mpsc, oneshot},
-    compat::{Future01CompatExt as _, Stream01CompatExt as _},
-    lock::Mutex,
+    compat::Future01CompatExt as _,
     prelude::*,
 };
-use futures_intrusive::{channel::OneshotBroadcastChannel, sync::Semaphore};
-use lazy_static::lazy_static;
 use log;
-use reqwest::{
-    r#async::{Client, ClientBuilder},
-    Proxy,
-};
-use std::cell::Cell;
-use std::hash::Hash;
-use std::mem;
 use std::{
-    collections::{
-        hash_map::{Entry, HashMap},
-        HashSet,
-    },
-    convert::TryFrom,
-    env,
+    collections::HashMap,
+    hash::Hash,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -34,7 +20,6 @@ use std::{
     time::Duration,
 };
 use tokio::timer;
-use xz2;
 
 use super::{get_all_to_string, Result};
 
@@ -102,7 +87,7 @@ pub async fn fetch_meta_rec(
     let progress = Progress::new();
 
     const MAX_CONCURRENT_FETCH: usize = 128;
-    let request_sem = Arc::new(Semaphore::new(false, MAX_CONCURRENT_FETCH));
+    let request_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCH));
 
     struct Data(StorePathHash, Result<String>, mpsc::Sender<Data>);
     const FETCH_META_REC_CHANNEL_EXTRA_LEN: usize = 64;
@@ -115,11 +100,11 @@ pub async fn fetch_meta_rec(
     type Graph = DepGraph<StorePathHash>;
     let mut g: Graph = DepGraph::new();
 
-    let mut check_fetch = |g: &mut Graph,
-                           db: &mut Database,
-                           nars: &mut HashMap<StorePathHash, Option<Nar>>,
-                           hash: StorePathHash,
-                           tx: mpsc::Sender<Data>|
+    let check_fetch = |g: &mut Graph,
+                       db: &mut Database,
+                       nars: &mut HashMap<StorePathHash, Option<Nar>>,
+                       hash: StorePathHash,
+                       tx: mpsc::Sender<Data>|
      -> Result<()> {
         if nars.contains_key(&hash) {
             // Already visited.
@@ -139,7 +124,7 @@ pub async fn fetch_meta_rec(
         let info_url = format!("{}/{}.narinfo", cache_url, hash);
         spawn(async move {
             let ret = {
-                let _guard = request_sem.acquire(1).await;
+                let _guard = request_sem.acquire().await;
                 get_all_to_string(&info_url).await
             };
             // Channel only fails when main future done with errors.
@@ -182,15 +167,11 @@ pub async fn fetch_meta_rec(
     log::info!("Fetched {} paths", total);
 
     let mut ret = vec![];
-    dbg!(&nars);
     for cur_hash in g.topo_sort().iter().rev() {
-        dbg!(&cur_hash);
         if let Some(nar) = nars.get_mut(cur_hash).expect("Must visited").take() {
-            dbg!(&nar);
             ret.push(db.insert_or_ignore_nar(&nar, NarStatus::Pending)?);
         }
     }
-    dbg!(&ret);
     Ok(ret)
 }
 
@@ -250,6 +231,7 @@ mod tests {
     use super::*;
     use crate::block_on;
     use insta::assert_debug_snapshot;
+    use std::convert::TryFrom;
 
     #[test]
     #[ignore]
