@@ -139,7 +139,7 @@ impl Database {
     pub(crate) fn insert_root(
         &mut self,
         root: &Root,
-        root_nar_ids: impl IntoIterator<Item = i64>,
+        root_hashes: impl IntoIterator<Item = StorePathHash>,
     ) -> Result<i64> {
         let txn = self
             .conn
@@ -166,17 +166,17 @@ impl Database {
 
         let mut stmt = txn.prepare_cached(
             r"
-            INSERT INTO root_nar
-                (root_id, nar_id)
-                VALUES
-                (:root_id, :nar_id)
+            INSERT INTO root_nar (root_id, nar_id)
+            SELECT :root_id, id
+                FROM nar
+                WHERE hash = :hash
             ",
         )?;
 
-        for nar_id in root_nar_ids {
+        for hash in root_hashes {
             stmt.execute_named(named_params! {
                 ":root_id": root_id,
-                ":nar_id": nar_id,
+                ":hash": hash.as_str(),
             })?;
         }
 
@@ -186,19 +186,16 @@ impl Database {
     }
 
     /// References must be already present in database.
-    pub(crate) fn insert_or_ignore_nar(
-        &mut self,
-        status: NarStatus,
-        store_path: &StorePath,
-        meta: &NarMeta,
-        self_ref: bool,
-        ref_ids: impl IntoIterator<Item = i64>,
-    ) -> Result<i64> {
+    pub(crate) fn insert_or_ignore_nars<N, I>(&mut self, status: NarStatus, nars: I) -> Result<()>
+    where
+        I: IntoIterator<Item = N>,
+        N: std::borrow::Borrow<Nar>,
+    {
         let txn = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let nar_id = {
+        {
             let mut stmt_insert_nar = txn.prepare_cached(
                 r"
                 INSERT INTO nar
@@ -219,70 +216,55 @@ impl Database {
 
             let mut stmt_insert_ref = txn.prepare_cached(
                 r"
-                INSERT INTO nar_ref
-                    (nar_id, ref_id)
-                    VALUES
-                    (:nar_id, :ref_id)
-                ",
-            )?;
-
-            let mut stmt_select = txn.prepare_cached(
-                r"
-                SELECT id
+                INSERT INTO nar_ref (nar_id, ref_id)
+                SELECT :nar_id, id
                     FROM nar
-                    WHERE hash = ?
+                    WHERE hash = :hash
                 ",
             )?;
 
-            let ret = stmt_insert_nar.execute_named(named_params! {
-                ":store_root": store_path.root(),
-                ":hash": store_path.hash_str(),
-                ":name": store_path.name(),
+            for nar in nars {
+                let nar = nar.borrow();
+                let ret = stmt_insert_nar.execute_named(named_params! {
+                    ":store_root": nar.store_path.root(),
+                    ":hash": nar.store_path.hash_str(),
+                    ":name": nar.store_path.name(),
 
-                ":url": meta.url,
-                ":compression": meta.compression,
+                    ":url": nar.meta.url,
+                    ":compression": nar.meta.compression,
 
-                ":file_hash": meta.file_hash,
-                ":file_size": meta.file_size.map(|s| s as i64),
-                ":nar_hash": meta.nar_hash,
-                ":nar_size": meta.nar_size as i64,
+                    ":file_hash": nar.meta.file_hash,
+                    ":file_size": nar.meta.file_size.map(|s| s as i64),
+                    ":nar_hash": nar.meta.nar_hash,
+                    ":nar_size": nar.meta.nar_size as i64,
 
-                ":deriver": meta.deriver,
-                ":sig": meta.sig,
-                ":ca": meta.ca,
+                    ":deriver": nar.meta.deriver,
+                    ":sig": nar.meta.sig,
+                    ":ca": nar.meta.ca,
 
-                ":status": status,
-            });
+                    ":status": status,
+                });
 
-            match ret {
-                Ok(0) => {
-                    return stmt_select
-                        .query_row(params![store_path.hash().as_str()], |row| Ok(row.get(0)?))
-                        .map_err(Into::into);
-                }
-                Ok(1) => {
-                    let nar_id = txn.last_insert_rowid();
-                    if self_ref {
-                        stmt_insert_ref.execute_named(named_params! {
-                            ":nar_id": nar_id,
-                            ":ref_id": nar_id,
-                        })?;
+                match ret {
+                    Ok(0) => {}
+                    Ok(1) => {
+                        let nar_id = txn.last_insert_rowid();
+                        for hash in nar.ref_hashes() {
+                            // Self reference works here.
+                            stmt_insert_ref.execute_named(named_params! {
+                                ":nar_id": nar_id,
+                                ":hash": hash.expect("Invalid nar to insert").as_str(),
+                            })?;
+                        }
                     }
-                    for ref_id in ref_ids {
-                        stmt_insert_ref.execute_named(named_params! {
-                            ":nar_id": nar_id,
-                            ":ref_id": ref_id,
-                        })?;
-                    }
-                    nar_id
+                    Ok(_) => unreachable!(),
+                    Err(err) => return Err(err.into()),
                 }
-                Ok(_) => unreachable!(),
-                Err(err) => return Err(err.into()),
             }
-        };
+        }
 
         txn.commit()?;
-        Ok(nar_id)
+        Ok(())
     }
 
     pub(crate) fn select_nar_id_by_hash(&self, hash: &StorePathHash) -> Result<Option<i64>> {

@@ -132,10 +132,10 @@ pub async fn add_root_rec(
     cache_url: &str,
     root_paths: impl IntoIterator<Item = StorePath>,
 ) -> Result<i64> {
-    let root_ids =
-        fetch_meta_rec::fetch_meta_rec(db, cache_url, root_paths.into_iter().collect()).await?;
-    log::info!("Saving root with {} root paths", root_ids.len());
-    let id = db.insert_root(root, root_ids)?;
+    let root_hashes: Vec<StorePathHash> = root_paths.into_iter().map(|path| path.hash()).collect();
+    fetch_meta_rec::fetch_meta_rec(db, cache_url, root_hashes.clone()).await?;
+    log::info!("Saving root with {} root paths", root_hashes.len());
+    let id = db.insert_root(root, root_hashes)?;
     log::info!("New root {} added", id);
     Ok(id)
 }

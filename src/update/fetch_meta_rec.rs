@@ -12,7 +12,6 @@ use log;
 use std::{
     collections::HashMap,
     hash::Hash,
-    mem,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -87,29 +86,15 @@ struct Fetcher<'db> {
     db: &'db mut Database,
     cache_url: Arc<str>,
     progress: Progress,
-    nars: HashMap<StorePathHash, NarState>,
+    // None:      Fetching or present in database
+    // Some(nar): Fetched
+    nars: HashMap<StorePathHash, Option<Nar>>,
     dep_graph: DepGraph<StorePathHash>,
+
     done_tx: Option<mpsc::Sender<QueueData>>,
     done_rx: mpsc::Receiver<QueueData>,
     todo: Vec<StorePathHash>,
     permits: usize,
-    root_hashes: Vec<StorePathHash>,
-}
-
-#[derive(Debug)]
-enum NarState {
-    Fetching,
-    Fetched(Nar),
-    Inserted(i64),
-}
-
-impl NarState {
-    fn as_inserted(&self) -> Option<i64> {
-        match self {
-            Self::Inserted(id) => Some(*id),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -118,11 +103,7 @@ struct QueueData(StorePathHash, Result<String>, mpsc::Sender<QueueData>);
 impl<'db> Fetcher<'db> {
     const MAX_CONCURRENT_FETCH: usize = 128;
 
-    fn new(
-        db: &'db mut Database,
-        cache_url: Arc<str>,
-        root_hashes: Vec<StorePathHash>,
-    ) -> Result<Self> {
+    fn new(db: &'db mut Database, cache_url: Arc<str>) -> Result<Self> {
         let (done_tx, done_rx) = mpsc::channel(Self::MAX_CONCURRENT_FETCH);
         Ok(Self {
             db,
@@ -134,7 +115,6 @@ impl<'db> Fetcher<'db> {
             done_rx,
             todo: vec![],
             permits: Self::MAX_CONCURRENT_FETCH,
-            root_hashes,
         })
     }
 
@@ -144,12 +124,11 @@ impl<'db> Fetcher<'db> {
             return Ok(());
         }
         self.dep_graph.add_node(hash);
-        if let Some(id) = self.db.select_nar_id_by_hash(&hash)? {
-            self.nars.insert(hash, NarState::Inserted(id));
+        self.nars.insert(hash, None);
+        if self.db.select_nar_id_by_hash(&hash)?.is_some() {
             // Already in database.
             return Ok(());
         }
-        self.nars.insert(hash, NarState::Fetching);
         self.progress.total().fetch_add(1, Ordering::Relaxed);
         self.todo.push(hash);
         Ok(())
@@ -184,16 +163,17 @@ impl<'db> Fetcher<'db> {
                 self.dep_graph.add_dep(cur_hash, hash);
             }
         }
-        *self.nars.get_mut(&cur_hash).expect("Already inserted") = NarState::Fetched(nar);
+        *self.nars.get_mut(&cur_hash).expect("Already inserted") = Some(nar);
         Ok(())
     }
 
-    async fn fetch_all(&mut self) -> Result<u64> {
-        let root_hashes = mem::replace(&mut self.root_hashes, vec![]);
-        for &hash in &root_hashes {
+    async fn fetch_all(
+        &mut self,
+        root_hashes: impl IntoIterator<Item = StorePathHash>,
+    ) -> Result<u64> {
+        for hash in root_hashes {
             self.check_add_todo(hash)?;
         }
-        self.root_hashes = root_hashes;
 
         let done_tx = self.done_tx.take().expect("Cannot fetch all twice");
         self.spawn_fetchers(&done_tx);
@@ -214,57 +194,38 @@ impl<'db> Fetcher<'db> {
 
         let total = self.progress.total().load(Ordering::Relaxed);
         let finished = self.progress.finished().load(Ordering::Relaxed);
-        ensure!(total == finished, "Some error occurred",);
+        ensure!(total == finished, "Some error occurred");
+        log::info!("{} paths fetched", total);
         Ok(total)
     }
 
-    fn save_all(self) -> Result<Vec<i64>> {
-        // Avoid over capturing `self`
-        let mut nars = self.nars;
-        for &hash in self.dep_graph.topo_sort().iter().rev() {
-            match &nars[&hash] {
-                NarState::Inserted(_) => {}
-                NarState::Fetched(nar) => {
-                    let self_ref = nar.ref_hashes().any(|h| h.unwrap() == hash);
-                    let ref_ids = nar
-                        .ref_hashes()
-                        .map(|h| h.unwrap())
-                        .filter(|h| h != &hash)
-                        .map(|h| nars[&h].as_inserted().unwrap());
-                    let id = self.db.insert_or_ignore_nar(
-                        NarStatus::Pending,
-                        &nar.store_path,
-                        &nar.meta,
-                        self_ref,
-                        ref_ids,
-                    )?;
-                    *nars.get_mut(&hash).unwrap() = NarState::Inserted(id);
-                }
-                NarState::Fetching => unreachable!("Everything is fetched"),
-            }
-        }
-        let ret = self
-            .root_hashes
-            .iter()
-            .map(|hash| nars[hash].as_inserted().expect("Should be inserted"))
-            .collect();
-        Ok(ret)
+    fn save_all(self) -> Result<()> {
+        log::info!("Saving narinfos...");
+        // Avoid over-capturing `self`
+        let nars = self.nars;
+        let topo_ord = self.dep_graph.topo_sort();
+        self.db.insert_or_ignore_nars(
+            NarStatus::Pending,
+            topo_ord
+                .iter()
+                .rev()
+                .filter_map(|&hash| nars[&hash].as_ref()),
+        )?;
+        Ok(())
     }
 }
 
 pub async fn fetch_meta_rec(
     db: &mut Database,
     cache_url: &str,
-    root_paths: Vec<StorePath>,
-) -> Result<Vec<i64>> {
-    log::info!("Recursively fetching {} narinfo", root_paths.len());
-    let root_hashes = root_paths.into_iter().map(|path| path.hash()).collect();
-    let mut fetcher = Fetcher::new(db, cache_url.into(), root_hashes)?;
-    let total = fetcher.fetch_all().await?;
-    log::info!("Fetched {} paths, saving...", total);
-    let ids = fetcher.save_all()?;
+    root_hashes: Vec<StorePathHash>,
+) -> Result<()> {
+    log::info!("Recursively fetching {} narinfo", root_hashes.len());
+    let mut fetcher = Fetcher::new(db, cache_url.into())?;
+    fetcher.fetch_all(root_hashes).await?;
+    fetcher.save_all()?;
     log::info!("All paths saved");
-    Ok(ids)
+    Ok(())
 }
 
 struct DepGraph<V> {
@@ -336,21 +297,20 @@ mod tests {
             let root_paths = vec![
                 // hello -> [hello, glibc]
                 StorePath::try_from("/nix/store/yhzvzdq82lzk0kvrp3i79yhjnhps6qpk-hello-2.10")
-                    .unwrap(),
+                    .unwrap()
+                    .hash(),
                 // openssl.src -> []
                 StorePath::try_from(
                     "/nix/store/fv8g2yczna9d78d150km0h73fkijw021-openssl-1.1.1d.tar.gz",
                 )
-                .unwrap(),
+                .unwrap()
+                .hash(),
             ];
 
             let mut db = Database::open_in_memory().unwrap();
-            let mut ids = fetch_meta_rec(&mut db, cache_url, root_paths)
+            fetch_meta_rec(&mut db, cache_url, root_paths)
                 .await
                 .unwrap();
-            ids.sort();
-            // Only top-level.
-            assert_eq!(ids, vec![2, 3]);
 
             let mut nars = vec![];
             db.select_all_nar(NarStatus::Pending, |_, nar| nars.push(nar))
