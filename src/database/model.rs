@@ -66,11 +66,15 @@ impl Default for NarStatus {
 }
 
 impl Nar {
-    pub fn ref_paths(&self) -> impl Iterator<Item = Result<StorePath, Error>> + '_ {
+    fn ref_paths(&self) -> impl Iterator<Item = Result<StorePath, Error>> + '_ {
         // Yield nothing on empty string.
         self.references.split_terminator(" ").map(move |basename| {
             StorePath::try_from(format!("{}/{}", self.store_path.root(), basename))
         })
+    }
+
+    pub fn ref_hashes(&self) -> impl Iterator<Item = Result<StorePathHash, Error>> + '_ {
+        self.ref_paths().map(|r| r.map(|path| path.hash()))
     }
 
     pub fn format_nar_info<'a>(&'a self) -> impl fmt::Display + 'a {

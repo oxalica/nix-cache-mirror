@@ -1,7 +1,6 @@
 use crate::{
     database::{model::*, Database},
     spawn,
-    util::Semaphore,
 };
 use failure::{ensure, format_err, ResultExt as _};
 use futures::{
@@ -13,6 +12,7 @@ use log;
 use std::{
     collections::HashMap,
     hash::Hash,
+    mem,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -27,7 +27,7 @@ use super::{get_all_to_string, Result};
 struct Progress {
     state: Arc<ProgressState>,
     // Drop it to stop.
-    stopper_tx: oneshot::Sender<()>,
+    stopper_tx: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Debug)]
@@ -64,7 +64,10 @@ impl Progress {
         if log::log_enabled!(log::Level::Info) {
             spawn(Self::logger(state.clone(), stopper_rx));
         }
-        Self { state, stopper_tx }
+        Self {
+            state,
+            stopper_tx: Some(stopper_tx),
+        }
     }
 
     fn total(&self) -> &AtomicU64 {
@@ -74,6 +77,179 @@ impl Progress {
     fn finished(&self) -> &AtomicU64 {
         &self.state.finished
     }
+
+    fn stop(&mut self) {
+        self.stopper_tx = None;
+    }
+}
+
+struct Fetcher<'db> {
+    db: &'db mut Database,
+    cache_url: Arc<str>,
+    progress: Progress,
+    nars: HashMap<StorePathHash, NarState>,
+    dep_graph: DepGraph<StorePathHash>,
+    done_tx: Option<mpsc::Sender<QueueData>>,
+    done_rx: mpsc::Receiver<QueueData>,
+    todo: Vec<StorePathHash>,
+    permits: usize,
+    root_hashes: Vec<StorePathHash>,
+}
+
+#[derive(Debug)]
+enum NarState {
+    Fetching,
+    Fetched(Nar),
+    Inserted(i64),
+}
+
+impl NarState {
+    fn as_inserted(&self) -> Option<i64> {
+        match self {
+            Self::Inserted(id) => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueueData(StorePathHash, Result<String>, mpsc::Sender<QueueData>);
+
+impl<'db> Fetcher<'db> {
+    const MAX_CONCURRENT_FETCH: usize = 128;
+
+    fn new(
+        db: &'db mut Database,
+        cache_url: Arc<str>,
+        root_hashes: Vec<StorePathHash>,
+    ) -> Result<Self> {
+        let (done_tx, done_rx) = mpsc::channel(Self::MAX_CONCURRENT_FETCH);
+        Ok(Self {
+            db,
+            cache_url,
+            progress: Progress::new(),
+            nars: Default::default(),
+            dep_graph: Default::default(),
+            done_tx: Some(done_tx),
+            done_rx,
+            todo: vec![],
+            permits: Self::MAX_CONCURRENT_FETCH,
+            root_hashes,
+        })
+    }
+
+    fn check_add_todo(&mut self, hash: StorePathHash) -> Result<()> {
+        if self.nars.contains_key(&hash) {
+            // Already visited.
+            return Ok(());
+        }
+        self.dep_graph.add_node(hash);
+        if let Some(id) = self.db.select_nar_id_by_hash(&hash)? {
+            self.nars.insert(hash, NarState::Inserted(id));
+            // Already in database.
+            return Ok(());
+        }
+        self.nars.insert(hash, NarState::Fetching);
+        self.progress.total().fetch_add(1, Ordering::Relaxed);
+        self.todo.push(hash);
+        Ok(())
+    }
+
+    fn spawn_fetchers(&mut self, done_tx: &mpsc::Sender<QueueData>) {
+        while self.permits != 0 {
+            let hash = match self.todo.pop() {
+                None => return,
+                Some(hash) => hash,
+            };
+            self.permits -= 1;
+
+            let info_url = format!("{}/{}.narinfo", self.cache_url, hash);
+            let done_tx = done_tx.clone();
+            spawn(async move {
+                let ret = get_all_to_string(&info_url).await;
+                // Channel only fails when main future done with errors.
+                // So just them ignore to suppress more errors.
+                let _ = done_tx.clone().send(QueueData(hash, ret, done_tx)).await;
+            });
+        }
+    }
+
+    fn parse_one(&mut self, ret: Result<String>) -> Result<()> {
+        let nar = Nar::parse_nar_info(&ret?)?;
+        let cur_hash = nar.store_path.hash();
+        for hash in nar.ref_hashes() {
+            let hash = hash?;
+            if hash != cur_hash {
+                self.check_add_todo(hash)?;
+                self.dep_graph.add_dep(cur_hash, hash);
+            }
+        }
+        *self.nars.get_mut(&cur_hash).expect("Already inserted") = NarState::Fetched(nar);
+        Ok(())
+    }
+
+    async fn fetch_all(&mut self) -> Result<u64> {
+        let root_hashes = mem::replace(&mut self.root_hashes, vec![]);
+        for &hash in &root_hashes {
+            self.check_add_todo(hash)?;
+        }
+        self.root_hashes = root_hashes;
+
+        let done_tx = self.done_tx.take().expect("Cannot fetch all twice");
+        self.spawn_fetchers(&done_tx);
+        // Ensure all `done_tx` is hold by sub-fetchers, so that
+        // the main mpsc channel will be closed when all sub-fetchers finished.
+        drop(done_tx);
+
+        while let Some(QueueData(hash, ret, done_tx)) = self.done_rx.next().await {
+            self.permits += 1;
+
+            self.parse_one(ret)
+                .with_context(|err| format_err!("Failed to get {}: {}", hash, err))?;
+            self.progress.finished().fetch_add(1, Ordering::Relaxed);
+
+            self.spawn_fetchers(&done_tx);
+        }
+        self.progress.stop();
+
+        let total = self.progress.total().load(Ordering::Relaxed);
+        let finished = self.progress.finished().load(Ordering::Relaxed);
+        ensure!(total == finished, "Some error occurred",);
+        Ok(total)
+    }
+
+    fn save_all(self) -> Result<Vec<i64>> {
+        // Avoid over capturing `self`
+        let mut nars = self.nars;
+        for &hash in self.dep_graph.topo_sort().iter().rev() {
+            match &nars[&hash] {
+                NarState::Inserted(_) => {}
+                NarState::Fetched(nar) => {
+                    let self_ref = nar.ref_hashes().any(|h| h.unwrap() == hash);
+                    let ref_ids = nar
+                        .ref_hashes()
+                        .map(|h| h.unwrap())
+                        .filter(|h| h != &hash)
+                        .map(|h| nars[&h].as_inserted().unwrap());
+                    let id = self.db.insert_or_ignore_nar(
+                        NarStatus::Pending,
+                        &nar.store_path,
+                        &nar.meta,
+                        self_ref,
+                        ref_ids,
+                    )?;
+                    *nars.get_mut(&hash).unwrap() = NarState::Inserted(id);
+                }
+                NarState::Fetching => unreachable!("Everything is fetched"),
+            }
+        }
+        let ret = self
+            .root_hashes
+            .iter()
+            .map(|hash| nars[hash].as_inserted().expect("Should be inserted"))
+            .collect();
+        Ok(ret)
+    }
 }
 
 pub async fn fetch_meta_rec(
@@ -82,97 +258,13 @@ pub async fn fetch_meta_rec(
     root_paths: Vec<StorePath>,
 ) -> Result<Vec<i64>> {
     log::info!("Recursively fetching {} narinfo", root_paths.len());
-
-    let cache_url: Arc<str> = cache_url.into();
-    let progress = Progress::new();
-
-    const MAX_CONCURRENT_FETCH: usize = 128;
-    let request_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCH));
-
-    struct Data(StorePathHash, Result<String>, mpsc::Sender<Data>);
-    const FETCH_META_REC_CHANNEL_EXTRA_LEN: usize = 64;
-    let (tx, mut rx) = mpsc::channel(root_paths.len() + FETCH_META_REC_CHANNEL_EXTRA_LEN);
-
-    // None:      Fetching or already in database
-    // Some(nar): Fetched
-    let mut nars: HashMap<StorePathHash, Option<Nar>> = Default::default();
-
-    type Graph = DepGraph<StorePathHash>;
-    let mut g: Graph = DepGraph::new();
-
-    let check_fetch = |g: &mut Graph,
-                       db: &mut Database,
-                       nars: &mut HashMap<StorePathHash, Option<Nar>>,
-                       hash: StorePathHash,
-                       tx: mpsc::Sender<Data>|
-     -> Result<()> {
-        if nars.contains_key(&hash) {
-            // Already visited.
-            return Ok(());
-        }
-        g.add_node(hash);
-        if db.select_nar_id_by_hash(&hash)?.is_some() {
-            nars.insert(hash, None);
-            // Already in database.
-            return Ok(());
-        }
-        nars.insert(hash, None);
-        progress.total().fetch_add(1, Ordering::Relaxed);
-
-        let request_sem = request_sem.clone();
-        let tx = tx.clone();
-        let info_url = format!("{}/{}.narinfo", cache_url, hash);
-        spawn(async move {
-            let ret = {
-                let _guard = request_sem.acquire().await;
-                get_all_to_string(&info_url).await
-            };
-            // Channel only fails when main future done with errors.
-            // So just them ignore to suppress more errors.
-            let _ = tx.clone().send(Data(hash, ret, tx)).await;
-        });
-        Ok(())
-    };
-
-    for path in root_paths {
-        check_fetch(&mut g, db, &mut nars, path.hash(), tx.clone())?;
-    }
-
-    // Ensure all `tx` is hold by sub-fetchers, so that
-    // the main mpsc channel will be closed when all sub-fetchers finished.
-    drop(tx);
-
-    while let Some(Data(hash, ret, tx)) = rx.next().await {
-        (|| -> Result<()> {
-            let nar = Nar::parse_nar_info(&ret?)?;
-            let cur_hash = nar.store_path.hash();
-            for path in nar.ref_paths() {
-                let hash = path?.hash();
-                if hash != cur_hash {
-                    check_fetch(&mut g, db, &mut nars, hash, tx.clone())?;
-                    g.add_dep(cur_hash, hash);
-                }
-            }
-            *nars.get_mut(&cur_hash).expect("Already inserted") = Some(nar);
-            Ok(())
-        })()
-        .with_context(|err| format_err!("Failed to get {}: {}", hash, err))?;
-        progress.finished().fetch_add(1, Ordering::Relaxed);
-    }
-
-    let total = progress.total().load(Ordering::Relaxed);
-    let finished = progress.finished().load(Ordering::Relaxed);
-    ensure!(total == finished, "Some error occurred",);
-    drop(progress);
-    log::info!("Fetched {} paths", total);
-
-    let mut ret = vec![];
-    for cur_hash in g.topo_sort().iter().rev() {
-        if let Some(nar) = nars.get_mut(cur_hash).expect("Must visited").take() {
-            ret.push(db.insert_or_ignore_nar(&nar, NarStatus::Pending)?);
-        }
-    }
-    Ok(ret)
+    let root_hashes = root_paths.into_iter().map(|path| path.hash()).collect();
+    let mut fetcher = Fetcher::new(db, cache_url.into(), root_hashes)?;
+    let total = fetcher.fetch_all().await?;
+    log::info!("Fetched {} paths, saving...", total);
+    let ids = fetcher.save_all()?;
+    log::info!("All paths saved");
+    Ok(ids)
 }
 
 struct DepGraph<V> {
@@ -180,14 +272,16 @@ struct DepGraph<V> {
     inds: HashMap<V, usize>,
 }
 
-impl<V: Hash + Eq + Copy> DepGraph<V> {
-    fn new() -> Self {
+impl<V: Hash + Eq> Default for DepGraph<V> {
+    fn default() -> Self {
         Self {
             edges: Default::default(),
             inds: Default::default(),
         }
     }
+}
 
+impl<V: Hash + Eq + Copy> DepGraph<V> {
     fn add_node(&mut self, a: V) {
         assert!(
             self.edges.insert(a, Default::default()).is_none(),
@@ -255,7 +349,8 @@ mod tests {
                 .await
                 .unwrap();
             ids.sort();
-            assert_eq!(ids, vec![1, 2, 3]);
+            // Only top-level.
+            assert_eq!(ids, vec![2, 3]);
 
             let mut nars = vec![];
             db.select_all_nar(NarStatus::Pending, |_, nar| nars.push(nar))

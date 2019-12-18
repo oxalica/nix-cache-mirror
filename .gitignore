@@ -3,6 +3,7 @@
 /.vscode
 **/*.pending-snap
 perf.data
+perf.data.old
 flamegraph.svg
 
 /data

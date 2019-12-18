@@ -186,78 +186,101 @@ impl Database {
     }
 
     /// References must be already present in database.
-    pub(crate) fn insert_or_ignore_nar(&mut self, nar: &Nar, status: NarStatus) -> Result<i64> {
+    pub(crate) fn insert_or_ignore_nar(
+        &mut self,
+        status: NarStatus,
+        store_path: &StorePath,
+        meta: &NarMeta,
+        self_ref: bool,
+        ref_ids: impl IntoIterator<Item = i64>,
+    ) -> Result<i64> {
         let txn = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let ret = txn.execute_named(
-            r"
-            INSERT INTO nar
-                ( store_root, hash, name
-                , url, compression
-                , file_hash, file_size, nar_hash, nar_size
-                , deriver, sig, ca
-                , status )
-                VALUES
-                ( :store_root, :hash, :name
-                , :url, :compression
-                , :file_hash, :file_size, :nar_hash, :nar_size
-                , :deriver, :sig, :ca
-                , :status )
-                ON CONFLICT DO NOTHING
-            ",
-            named_params! {
-                ":store_root": nar.store_path.root(),
-                ":hash": nar.store_path.hash_str(),
-                ":name": nar.store_path.name(),
+        let nar_id = {
+            let mut stmt_insert_nar = txn.prepare_cached(
+                r"
+                INSERT INTO nar
+                    ( store_root, hash, name
+                    , url, compression
+                    , file_hash, file_size, nar_hash, nar_size
+                    , deriver, sig, ca
+                    , status )
+                    VALUES
+                    ( :store_root, :hash, :name
+                    , :url, :compression
+                    , :file_hash, :file_size, :nar_hash, :nar_size
+                    , :deriver, :sig, :ca
+                    , :status )
+                    ON CONFLICT DO NOTHING
+                ",
+            )?;
 
-                ":url": nar.meta.url,
-                ":compression": nar.meta.compression,
+            let mut stmt_insert_ref = txn.prepare_cached(
+                r"
+                INSERT INTO nar_ref
+                    (nar_id, ref_id)
+                    VALUES
+                    (:nar_id, :ref_id)
+                ",
+            )?;
 
-                ":file_hash": nar.meta.file_hash,
-                ":file_size": nar.meta.file_size.map(|s| s as i64),
-                ":nar_hash": nar.meta.nar_hash,
-                ":nar_size": nar.meta.nar_size as i64,
+            let mut stmt_select = txn.prepare_cached(
+                r"
+                SELECT id
+                    FROM nar
+                    WHERE hash = ?
+                ",
+            )?;
 
-                ":deriver": nar.meta.deriver,
-                ":sig": nar.meta.sig,
-                ":ca": nar.meta.ca,
+            let ret = stmt_insert_nar.execute_named(named_params! {
+                ":store_root": store_path.root(),
+                ":hash": store_path.hash_str(),
+                ":name": store_path.name(),
+
+                ":url": meta.url,
+                ":compression": meta.compression,
+
+                ":file_hash": meta.file_hash,
+                ":file_size": meta.file_size.map(|s| s as i64),
+                ":nar_hash": meta.nar_hash,
+                ":nar_size": meta.nar_size as i64,
+
+                ":deriver": meta.deriver,
+                ":sig": meta.sig,
+                ":ca": meta.ca,
 
                 ":status": status,
-            },
-        );
+            });
 
-        let nar_id: i64 = match ret {
-            Ok(0) => {
-                return Ok(txn.query_row(
-                    r"SELECT id FROM nar WHERE hash = ?",
-                    params![nar.store_path.hash().as_str()],
-                    |row| Ok(row.get(0)?),
-                )?);
+            match ret {
+                Ok(0) => {
+                    return stmt_select
+                        .query_row(params![store_path.hash().as_str()], |row| Ok(row.get(0)?))
+                        .map_err(Into::into);
+                }
+                Ok(1) => {
+                    let nar_id = txn.last_insert_rowid();
+                    if self_ref {
+                        stmt_insert_ref.execute_named(named_params! {
+                            ":nar_id": nar_id,
+                            ":ref_id": nar_id,
+                        })?;
+                    }
+                    for ref_id in ref_ids {
+                        stmt_insert_ref.execute_named(named_params! {
+                            ":nar_id": nar_id,
+                            ":ref_id": ref_id,
+                        })?;
+                    }
+                    nar_id
+                }
+                Ok(_) => unreachable!(),
+                Err(err) => return Err(err.into()),
             }
-            Ok(1) => txn.last_insert_rowid(),
-            Ok(_) => unreachable!(),
-            Err(err) => return Err(err.into()),
         };
 
-        let mut stmt = txn.prepare_cached(
-            r"
-            INSERT INTO nar_ref
-                (nar_id, ref_id)
-            SELECT :nar_id, id
-                FROM nar
-                WHERE hash = :hash
-            ",
-        )?;
-        for ref_path in nar.ref_paths() {
-            stmt.execute_named(named_params! {
-                ":nar_id": nar_id,
-                ":hash": ref_path.expect("Nar should be valid for database").hash_str(),
-            })?;
-        }
-
-        drop(stmt);
         txn.commit()?;
         Ok(nar_id)
     }

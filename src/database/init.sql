@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS root_nar (
     nar_id INTEGER NOT NULL
         REFERENCES nar(id),
     PRIMARY KEY (root_id, nar_id)
-) WITHOUT ROWID;
+);
+
+CREATE INDEX IF NOT EXISTS root_referencee_idx ON root_nar (nar_id);
 
 CREATE TABLE IF NOT EXISTS nar (
     -- Row id
@@ -65,9 +67,9 @@ CREATE TABLE IF NOT EXISTS nar_ref (
         REFERENCES nar (id)
         ON DELETE RESTRICT,
     PRIMARY KEY (nar_id, ref_id) -- Index
-) WITHOUT ROWID;
+);
 
-CREATE INDEX IF NOT EXISTS idx_referencee ON nar_ref (ref_id);
+CREATE INDEX IF NOT EXISTS nar_referencee_idx ON nar_ref (ref_id);
 
 CREATE TRIGGER IF NOT EXISTS delete_self_ref
     BEFORE DELETE
